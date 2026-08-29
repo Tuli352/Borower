@@ -1,0 +1,72 @@
+name: Deploy Kogi Ride Backend
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create Firebase Config
+        env:
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: printf "%s" "$FIREBASE_CREDENTIALS" > firebase-service-account.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies and Build
+        run: |
+          npm install --legacy-peer-deps
+          npx prisma generate
+          npm run build
+
+      - name: Copy built files to EC2
+        uses: appleboy/scp-action@v0.1.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "dist/,package.json,prisma/,.env,firebase-service-account.json"
+          target: "/home/ubuntu/kogi-rider-backend"
+
+      - name: Deploy and Restart on EC2
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Ensure Node is in path (common for NVM setups)
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            
+            cd /home/ubuntu/kogi-rider-backend
+            
+            echo "--- PULLING LATEST CODE ---"
+            git pull origin main
+            
+            echo "--- INSTALLING DEPENDENCIES ---"
+            npm install --legacy-peer-deps
+            
+            echo "--- DATABASE & IDENTITY SYNC ---"
+            npx prisma generate
+            npx prisma db push --accept-data-loss
+            
+            echo "--- BUILDING APPLICATION ---"
+            npm run build
+            
+            echo "--- RESTARTING PROCESSES ---"
+            pm2 delete kogi-backend || true
+            pm2 start dist/main.js --name kogi-backend --update-env
+            pm2 save
+            
+            echo "✅ DEPLOYMENT COMPLETE"
