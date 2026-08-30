@@ -1,1 +1,706 @@
-PLACEHOLDER_WILL_FAIL
+diff --git a/src/customers/customers.regression.spec.ts b/src/customers/customers.regression.spec.ts
+new file mode 100644
+index 0000000..263e927
+--- /dev/null
++++ b/src/customers/customers.regression.spec.ts
+@@ -0,0 +1,388 @@
++/**
++ * Regression coverage for existing CustomersService behaviour.
++ * These tests exercise APIs that already exist at the base commit and must
++ * remain green with and without the referral feature.
++ */
++import { Test, TestingModule } from '@nestjs/testing';
++import { BadRequestException, NotFoundException } from '@nestjs/common';
++import { CustomersService } from './customers.service';
++import { PrismaService } from '../prisma/prisma.service';
++
++describe('CustomersService regression', () => {
++  let service: CustomersService;
++  let prisma: any;
++
++  beforeEach(async () => {
++    prisma = {
++      customer: {
++        findMany: jest.fn(),
++        findUnique: jest.fn(),
++        create: jest.fn(),
++        update: jest.fn(),
++        delete: jest.fn(),
++        count: jest.fn(),
++      },
++      account: {
++        findFirst: jest.fn(),
++        create: jest.fn(),
++        update: jest.fn(),
++      },
++      savedLocation: {
++        create: jest.fn(),
++        findMany: jest.fn(),
++        delete: jest.fn(),
++      },
++      transaction: {
++        findMany: jest.fn(),
++      },
++      $transaction: jest.fn((fn) => fn(prisma)),
++    };
++
++    const referralStub = {
++      redeem: jest.fn(),
++      loadProfileWithReferralSummary: jest.fn(async (id: string) => {
++        const row = await prisma.customer.findUnique({ where: { id } });
++        return row;
++      }),
++      countReferrals: jest.fn(),
++      getReferralStanding: jest.fn(),
++    };
++
++    const providers: any[] = [
++      CustomersService,
++      { provide: PrismaService, useValue: prisma },
++    ];
++
++    try {
++      // eslint-disable-next-line @typescript-eslint/no-var-requires
++      const { ReferralService } = require('./referral.service');
++      providers.push({ provide: ReferralService, useValue: referralStub });
++    } catch {
++      // base commit: no ReferralService
++    }
++
++    const module: TestingModule = await Test.createTestingModule({
++      providers,
++    }).compile();
++
++    service = module.get(CustomersService);
++  });
++
++  describe('findAll', () => {
++    it('orders by createdAt desc', async () => {
++      prisma.customer.findMany.mockResolvedValue([{ id: '1' }]);
++      await service.findAll();
++      expect(prisma.customer.findMany).toHaveBeenCalledWith({
++        orderBy: { createdAt: 'desc' },
++      });
++    });
++
++    it('returns the prisma result', async () => {
++      const rows = [{ id: 'a' }, { id: 'b' }];
++      prisma.customer.findMany.mockResolvedValue(rows);
++      await expect(service.findAll()).resolves.toBe(rows);
++    });
++  });
++
++  describe('saved locations', () => {
++    it('addSavedLocation creates with customerId', async () => {
++      prisma.savedLocation.create.mockResolvedValue({ id: 'loc1' });
++      await service.addSavedLocation('c1', {
++        name: 'Home',
++        address: '1 St',
++        latitude: 1,
++        longitude: 2,
++      });
++      expect(prisma.savedLocation.create).toHaveBeenCalledWith({
++        data: {
++          customerId: 'c1',
++          name: 'Home',
++          address: '1 St',
++          latitude: 1,
++          longitude: 2,
++        },
++      });
++    });
++
++    it('getSavedLocations filters by customerId', async () => {
++      prisma.savedLocation.findMany.mockResolvedValue([]);
++      await service.getSavedLocations('c1');
++      expect(prisma.savedLocation.findMany).toHaveBeenCalledWith({
++        where: { customerId: 'c1' },
++        orderBy: { createdAt: 'desc' },
++      });
++    });
++
++    it('removeSavedLocation deletes by id and customerId', async () => {
++      prisma.savedLocation.delete.mockResolvedValue({ id: 'loc1' });
++      await service.removeSavedLocation('c1', 'loc1');
++      expect(prisma.savedLocation.delete).toHaveBeenCalledWith({
++        where: { id: 'loc1', customerId: 'c1' },
++      });
++    });
++  });
++
++  describe('create', () => {
++    it('throws when no accountId phone or email', async () => {
++      await expect(service.create({ name: 'X' })).rejects.toThrow(
++        /accountId, phone, or email/,
++      );
++    });
++
++    it('creates account when missing then creates customer', async () => {
++      prisma.account.findFirst.mockResolvedValue(null);
++      prisma.account.create.mockResolvedValue({ id: 'acc1' });
++      prisma.customer.create.mockResolvedValue({
++        id: 'c1',
++        referralCode: 'ABC123',
++      });
++      const result = await service.create({
++        name: 'Ada',
++        phone: '+1000',
++        email: 'a@b.c',
++      });
++      expect(prisma.account.create).toHaveBeenCalled();
++      expect(prisma.customer.create).toHaveBeenCalled();
++      expect(result.id).toBe('c1');
++    });
++
++    it('reuses existing account by phone', async () => {
++      prisma.account.findFirst.mockResolvedValue({ id: 'acc-existing' });
++      prisma.account.update.mockResolvedValue({});
++      prisma.customer.create.mockResolvedValue({ id: 'c2' });
++      await service.create({ name: 'Bob', phone: '+2000' });
++      expect(prisma.account.update).toHaveBeenCalledWith({
++        where: { id: 'acc-existing' },
++        data: { hasCustomerProfile: true },
++      });
++    });
++
++    it('accepts explicit accountId without looking up phone', async () => {
++      prisma.customer.create.mockResolvedValue({ id: 'c3' });
++      await service.create({ name: 'C' }, 'acc-given');
++      expect(prisma.account.findFirst).not.toHaveBeenCalled();
++      expect(prisma.customer.create).toHaveBeenCalled();
++    });
++
++    it('links referredBy when signup code matches a customer', async () => {
++      prisma.customer.findUnique.mockResolvedValue({ id: 'referrer-1' });
++      prisma.customer.create.mockResolvedValue({ id: 'c-new' });
++      await service.create({ name: 'D', phone: '+3', referralCode: 'REF1' }, 'acc');
++      const createArg = prisma.customer.create.mock.calls[0][0];
++      expect(createArg.data.referredBy).toEqual({
++        connect: { id: 'referrer-1' },
++      });
++    });
++
++    it('skips referredBy when signup code unknown', async () => {
++      prisma.customer.findUnique.mockResolvedValue(null);
++      prisma.customer.create.mockResolvedValue({ id: 'c-new' });
++      await service.create({ name: 'E', phone: '+4', referralCode: 'NOPE' }, 'acc');
++      const createArg = prisma.customer.create.mock.calls[0][0];
++      expect(createArg.data.referredBy).toBeUndefined();
++    });
++  });
++
++  describe('update and delete', () => {
++    it('update returns prisma result', async () => {
++      prisma.customer.update.mockResolvedValue({ id: 'c1', name: 'New' });
++      await expect(service.update('c1', { name: 'New' })).resolves.toEqual({
++        id: 'c1',
++        name: 'New',
++      });
++    });
++
++    it('update maps P2002 to BadRequestException', async () => {
++      const err: any = new Error('dup');
++      err.code = 'P2002';
++      prisma.customer.update.mockRejectedValue(err);
++      await expect(service.update('c1', { email: 'x' })).rejects.toBeInstanceOf(
++        BadRequestException,
++      );
++    });
++
++    it('update maps P2025 to NotFoundException', async () => {
++      const err: any = new Error('missing');
++      err.code = 'P2025';
++      prisma.customer.update.mockRejectedValue(err);
++      await expect(service.update('c1', {})).rejects.toBeInstanceOf(
++        NotFoundException,
++      );
++    });
++
++    it('delete maps P2025 to NotFoundException', async () => {
++      const err: any = new Error('missing');
++      err.code = 'P2025';
++      prisma.customer.delete.mockRejectedValue(err);
++      await expect(service.delete('c1')).rejects.toBeInstanceOf(
++        NotFoundException,
++      );
++    });
++
++    it('delete returns deleted row', async () => {
++      prisma.customer.delete.mockResolvedValue({ id: 'c1' });
++      await expect(service.delete('c1')).resolves.toEqual({ id: 'c1' });
++    });
++  });
++
++  describe('subscribeToPlus', () => {
++    it('sets isKogiPlus and plusExpiry about 30 days out', async () => {
++      prisma.customer.update.mockImplementation(async ({ data }) => data);
++      const before = Date.now();
++      const result: any = await service.subscribeToPlus('c1');
++      expect(result.isKogiPlus).toBe(true);
++      expect(result.plusExpiry).toBeInstanceOf(Date);
++      const delta =
++        (result.plusExpiry as Date).getTime() - before;
++      expect(delta).toBeGreaterThan(29 * 24 * 3600 * 1000);
++      expect(delta).toBeLessThan(31 * 24 * 3600 * 1000);
++    });
++  });
++
++  describe('wallet', () => {
++    it('getWallet returns walletBalance', async () => {
++      prisma.customer.findUnique.mockResolvedValue({ walletBalance: 42.5 });
++      await expect(service.getWallet('c1')).resolves.toEqual({
++        walletBalance: 42.5,
++      });
++    });
++
++    it('getWallet 404 when missing', async () => {
++      prisma.customer.findUnique.mockResolvedValue(null);
++      await expect(service.getWallet('x')).rejects.toBeInstanceOf(
++        NotFoundException,
++      );
++    });
++
++    it('getWalletTransactions pages with skip/take', async () => {
++      prisma.transaction.findMany.mockResolvedValue([]);
++      await service.getWalletTransactions('c1', 10, 2);
++      expect(prisma.transaction.findMany).toHaveBeenCalledWith({
++        where: { customerId: 'c1' },
++        orderBy: { createdAt: 'desc' },
++        take: 10,
++        skip: 10,
++      });
++    });
++
++    it('getWalletTransactions defaults limit 50 page 1', async () => {
++      prisma.transaction.findMany.mockResolvedValue([]);
++      await service.getWalletTransactions('c1');
++      expect(prisma.transaction.findMany).toHaveBeenCalledWith(
++        expect.objectContaining({ take: 50, skip: 0 }),
++      );
++    });
++  });
++
++  describe('findOne baseline', () => {
++    it('loads customer by id (include orders and transactions when no referral helper)', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        name: 'Zed',
++        orders: [],
++        transactions: [],
++      });
++      const result = await service.findOne('c1');
++      expect(result).toBeTruthy();
++      expect(prisma.customer.findUnique).toHaveBeenCalled();
++    });
++  });
++});
++
++describe('CustomersService regression extra cases', () => {
++  let service: CustomersService;
++  let prisma: any;
++
++  beforeEach(async () => {
++    prisma = {
++      customer: {
++        findMany: jest.fn().mockResolvedValue([]),
++        findUnique: jest.fn(),
++        create: jest.fn(),
++        update: jest.fn(),
++        delete: jest.fn(),
++      },
++      account: {
++        findFirst: jest.fn(),
++        create: jest.fn(),
++        update: jest.fn(),
++      },
++      savedLocation: {
++        create: jest.fn(),
++        findMany: jest.fn().mockResolvedValue([]),
++        delete: jest.fn(),
++      },
++      transaction: { findMany: jest.fn().mockResolvedValue([]) },
++      $transaction: jest.fn((fn) => fn(prisma)),
++    };
++
++    const providers: any[] = [
++      CustomersService,
++      { provide: PrismaService, useValue: prisma },
++    ];
++    try {
++      const { ReferralService } = require('./referral.service');
++      providers.push({
++        provide: ReferralService,
++        useValue: {
++          redeem: jest.fn(),
++          loadProfileWithReferralSummary: jest.fn(async (id: string) =>
++            prisma.customer.findUnique({ where: { id } }),
++          ),
++        },
++      });
++    } catch {
++      /* base */
++    }
++
++    const module = await Test.createTestingModule({ providers }).compile();
++    service = module.get(CustomersService);
++  });
++
++  it('findAll empty list', async () => {
++    expect(await service.findAll()).toEqual([]);
++  });
++
++  it('getSavedLocations empty', async () => {
++    expect(await service.getSavedLocations('c')).toEqual([]);
++  });
++
++  it('create with email only', async () => {
++    prisma.account.findFirst.mockResolvedValue(null);
++    prisma.account.create.mockResolvedValue({ id: 'a' });
++    prisma.customer.create.mockResolvedValue({ id: 'c' });
++    await service.create({ name: 'E', email: 'e@e.e' });
++    expect(prisma.account.create).toHaveBeenCalledWith(
++      expect.objectContaining({
++        data: expect.objectContaining({ email: 'e@e.e' }),
++      }),
++    );
++  });
++
++  it('update rethrows unknown errors', async () => {
++    prisma.customer.update.mockRejectedValue(new Error('boom'));
++    await expect(service.update('c', {})).rejects.toThrow('boom');
++  });
++
++  it('delete rethrows unknown errors', async () => {
++    prisma.customer.delete.mockRejectedValue(new Error('boom'));
++    await expect(service.delete('c')).rejects.toThrow('boom');
++  });
++
++  for (let i = 0; i < 20; i++) {
++    it(`findAll stability call ${i}`, async () => {
++      prisma.customer.findMany.mockResolvedValue([{ id: String(i) }]);
++      const rows = await service.findAll();
++      expect(rows[0].id).toBe(String(i));
++    });
++  }
++
++  for (let i = 0; i < 15; i++) {
++    it(`getWallet balance ${i}`, async () => {
++      prisma.customer.findUnique.mockResolvedValue({ walletBalance: i });
++      await expect(service.getWallet('c')).resolves.toEqual({
++        walletBalance: i,
++      });
++    });
++  }
++});
+diff --git a/src/customers/referral.behavior.spec.ts b/src/customers/referral.behavior.spec.ts
+new file mode 100644
+index 0000000..266881b
+--- /dev/null
++++ b/src/customers/referral.behavior.spec.ts
+@@ -0,0 +1,306 @@
++/**
++ * Public-contract tests for referral redemption.
++ * Outcomes only: controller return values, Nest exceptions, DTO validation,
++ * route metadata, and profile fields. No fixed Prisma call sequences.
++ */
++import { Test, TestingModule } from '@nestjs/testing';
++import {
++  BadRequestException,
++  NotFoundException,
++  ConflictException,
++  RequestMethod,
++} from '@nestjs/common';
++import { PATH_METADATA, METHOD_METADATA } from '@nestjs/common/constants';
++import { validate } from 'class-validator';
++import { CustomersController } from './customers.controller';
++import { CustomersService } from './customers.service';
++import { PrismaService } from '../prisma/prisma.service';
++
++describe('Referral redemption (public behavior)', () => {
++  let controller: CustomersController;
++  let prisma: any;
++
++  const authed = (profileId: string) => ({ user: { profileId } });
++
++  /** Resolve the handler bound to POST profile/referral (any method name). */
++  function postReferralHandler(): (req: any, body: any) => Promise<any> {
++    const proto = Object.getPrototypeOf(controller);
++    for (const name of Object.getOwnPropertyNames(proto)) {
++      if (name === 'constructor') continue;
++      const path = Reflect.getMetadata(PATH_METADATA, proto[name]);
++      const method = Reflect.getMetadata(METHOD_METADATA, proto[name]);
++      if (
++        method === RequestMethod.POST &&
++        (path === 'profile/referral' || path === '/profile/referral')
++      ) {
++        return (req, body) => proto[name].call(controller, req, body);
++      }
++    }
++    // Fallback: common name used by the reference solution
++    if (typeof (controller as any).redeemReferral === 'function') {
++      return (req, body) => (controller as any).redeemReferral(req, body);
++    }
++    throw new Error('No POST profile/referral handler on CustomersController');
++  }
++
++  beforeEach(async () => {
++    prisma = {
++      customer: {
++        findUnique: jest.fn(),
++        update: jest.fn().mockResolvedValue({}),
++        count: jest.fn(),
++        findMany: jest.fn(),
++        create: jest.fn(),
++        delete: jest.fn(),
++      },
++      account: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
++      savedLocation: {
++        create: jest.fn(),
++        findMany: jest.fn(),
++        delete: jest.fn(),
++      },
++      transaction: { findMany: jest.fn() },
++      $transaction: jest.fn((fn) => fn(prisma)),
++    };
++
++    const providers: any[] = [
++      CustomersService,
++      { provide: PrismaService, useValue: prisma },
++    ];
++    try {
++      const { ReferralService } = require('./referral.service');
++      providers.push(ReferralService);
++    } catch {
++      /* base */
++    }
++
++    const module: TestingModule = await Test.createTestingModule({
++      controllers: [CustomersController],
++      providers,
++    }).compile();
++
++    controller = module.get(CustomersController);
++  });
++
++  describe('route metadata', () => {
++    it('exposes POST profile/referral on the controller', () => {
++      const proto = Object.getPrototypeOf(controller);
++      let found = false;
++      for (const name of Object.getOwnPropertyNames(proto)) {
++        if (name === 'constructor') continue;
++        const path = Reflect.getMetadata(PATH_METADATA, proto[name]);
++        const method = Reflect.getMetadata(METHOD_METADATA, proto[name]);
++        if (
++          method === RequestMethod.POST &&
++          (path === 'profile/referral' || path === '/profile/referral')
++        ) {
++          found = true;
++          break;
++        }
++      }
++      if (!found && typeof (controller as any).redeemReferral === 'function') {
++        found = true;
++      }
++      expect(found).toBe(true);
++    });
++  });
++
++  describe('POST /customers/profile/referral', () => {
++    it('links referee and awards 100 points to referrer', async () => {
++      const me = {
++        id: 'c-new',
++        referralCode: 'NEWCODE',
++        referredById: null,
++      };
++      const referrer = {
++        id: 'c-ref',
++        referralCode: 'REFCODE',
++        totalLoyaltyPoints: 10,
++      };
++      prisma.customer.findUnique.mockImplementation(async (args: any) => {
++        if (args?.where?.id === 'c-new') return { ...me };
++        if (args?.where?.referralCode === 'REFCODE') return { ...referrer };
++        return null;
++      });
++
++      const result = await postReferralHandler()(authed('c-new'), {
++        code: '  REFCODE  ',
++      });
++      expect(result).toEqual({
++        referredById: 'c-ref',
++        pointsAwarded: 100,
++      });
++      expect(prisma.customer.update.mock.calls.length).toBeGreaterThanOrEqual(1);
++    });
++
++    it('uses case-sensitive code match after trim', async () => {
++      prisma.customer.findUnique.mockImplementation(async (args: any) => {
++        if (args?.where?.id === 'c1') {
++          return { id: 'c1', referralCode: 'MINE', referredById: null };
++        }
++        if (args?.where?.referralCode === 'AbC') {
++          return { id: 'r1', referralCode: 'AbC' };
++        }
++        return null;
++      });
++
++      const result = await postReferralHandler()(authed('c1'), { code: 'AbC' });
++      expect(result).toEqual(
++        expect.objectContaining({
++          referredById: 'r1',
++          pointsAwarded: 100,
++        }),
++      );
++    });
++
++    it('400 invalid_referral_code for empty or whitespace code', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        referralCode: 'MINE',
++        referredById: null,
++      });
++      await expect(
++        postReferralHandler()(authed('c1'), { code: '   ' }),
++      ).rejects.toBeInstanceOf(BadRequestException);
++      try {
++        await postReferralHandler()(authed('c1'), { code: '' });
++      } catch (e: any) {
++        const body = e.getResponse?.() ?? e.response ?? e.message;
++        expect(JSON.stringify(body)).toMatch(/invalid_referral_code/);
++      }
++    });
++
++    it('409 when already referred', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        referralCode: 'MINE',
++        referredById: 'already',
++      });
++      await expect(
++        postReferralHandler()(authed('c1'), { code: 'OTHER' }),
++      ).rejects.toBeInstanceOf(ConflictException);
++      try {
++        await postReferralHandler()(authed('c1'), { code: 'OTHER' });
++      } catch (e: any) {
++        const body = e.getResponse?.() ?? e.response ?? e.message;
++        expect(JSON.stringify(body)).toMatch(/referral_not_eligible/);
++      }
++    });
++
++    it('409 when redeeming own code', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        referralCode: 'OWN',
++        referredById: null,
++      });
++      await expect(
++        postReferralHandler()(authed('c1'), { code: 'OWN' }),
++      ).rejects.toBeInstanceOf(ConflictException);
++    });
++
++    it('404 referral_not_found for unknown code', async () => {
++      prisma.customer.findUnique.mockImplementation(async (args: any) => {
++        if (args?.where?.id === 'c1') {
++          return { id: 'c1', referralCode: 'MINE', referredById: null };
++        }
++        return null;
++      });
++      try {
++        await postReferralHandler()(authed('c1'), { code: 'NOPE' });
++        fail('expected throw');
++      } catch (e: any) {
++        expect(e).toBeInstanceOf(NotFoundException);
++        const body = e.getResponse?.() ?? e.response ?? e.message;
++        expect(JSON.stringify(body)).toMatch(/referral_not_found/);
++      }
++    });
++
++    it('409 when referredById is set before write completes', async () => {
++      let reads = 0;
++      prisma.customer.findUnique.mockImplementation(async (args: any) => {
++        if (args?.where?.referralCode === 'R') {
++          return { id: 'r1', referralCode: 'R' };
++        }
++        if (args?.where?.id === 'c1') {
++          reads += 1;
++          if (reads > 1) {
++            return {
++              id: 'c1',
++              referralCode: 'MINE',
++              referredById: 'race-winner',
++            };
++          }
++          return { id: 'c1', referralCode: 'MINE', referredById: null };
++        }
++        return null;
++      });
++      await expect(
++        postReferralHandler()(authed('c1'), { code: 'R' }),
++      ).rejects.toBeInstanceOf(ConflictException);
++    });
++
++    it('second redeem by same caller always not eligible', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        referralCode: 'MINE',
++        referredById: 'r1',
++      });
++      await expect(
++        postReferralHandler()(authed('c1'), { code: 'ANY' }),
++      ).rejects.toBeInstanceOf(ConflictException);
++    });
++  });
++
++  describe('RedeemReferralDto validation', () => {
++    it('rejects empty code with IsString/IsNotEmpty', async () => {
++      let Dto: any;
++      try {
++        Dto = require('./dto/redeem-referral.dto').RedeemReferralDto;
++      } catch {
++        fail('RedeemReferralDto is required by the public contract');
++        return;
++      }
++      const empty = Object.assign(new Dto(), { code: '' });
++      const missing = Object.assign(new Dto(), {});
++      const ok = Object.assign(new Dto(), { code: 'ABC123' });
++      expect((await validate(empty)).length).toBeGreaterThan(0);
++      expect((await validate(missing)).length).toBeGreaterThan(0);
++      expect(await validate(ok)).toEqual([]);
++    });
++  });
++
++  describe('GET /customers/profile enrichment', () => {
++    it('includes referralCount and totalLoyaltyPoints', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        name: 'Ada',
++        totalLoyaltyPoints: 250,
++        orders: [],
++        transactions: [],
++        _count: { referrals: 4 },
++      });
++      const profile = await controller.getProfile(authed('c1') as any);
++      expect(profile).toHaveProperty('referralCount', 4);
++      expect(profile).toHaveProperty('totalLoyaltyPoints', 250);
++    });
++
++    it('defaults referralCount to 0 when none', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        totalLoyaltyPoints: 0,
++        _count: { referrals: 0 },
++      });
++      const profile = await controller.getProfile(authed('c1') as any);
++      expect(profile).toHaveProperty('referralCount', 0);
++    });
++
++    it('defaults totalLoyaltyPoints to 0 when absent', async () => {
++      prisma.customer.findUnique.mockResolvedValue({
++        id: 'c1',
++        _count: { referrals: 0 },
++      });
++      const profile = await controller.getProfile(authed('c1') as any);
++      expect(profile).toHaveProperty('totalLoyaltyPoints', 0);
++    });
++  });
++});
