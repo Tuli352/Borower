@@ -394,13 +394,15 @@ index 0000000..263e927
 +});
 diff --git a/src/customers/referral.behavior.spec.ts b/src/customers/referral.behavior.spec.ts
 new file mode 100644
-index 0000000..263e927
+index 0000000..a1b2c3d
 --- /dev/null
 +++ b/src/customers/referral.behavior.spec.ts
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,269 @@
 +/**
 + * Behavioral tests for the referral redemption feature.
 + * Asserts only the public contract from instruction.md.
++ * These MUST fail on the base commit (no redeemReferral / no profile fields)
++ * and pass once the reference solution is applied.
 + */
 +import { Test, TestingModule } from '@nestjs/testing';
 +import {
@@ -456,10 +458,6 @@ index 0000000..263e927
 +
 +  describe('redeemReferral success', () => {
 +    it('links referee and awards 100 points to referrer', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') {
-+        return;
-+      }
-+
 +      const me = {
 +        id: 'c-new',
 +        referralCode: 'NEWCODE',
@@ -501,8 +499,6 @@ index 0000000..263e927
 +    });
 +
 +    it('uses case-sensitive code match after trim', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique
 +        .mockResolvedValueOnce({
 +          id: 'c1',
@@ -526,8 +522,6 @@ index 0000000..263e927
 +
 +  describe('redeemReferral error paths', () => {
 +    it('400 invalid_referral_code for empty or whitespace code', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        referralCode: 'MINE',
@@ -547,8 +541,6 @@ index 0000000..263e927
 +    });
 +
 +    it('400 invalid_referral_code for null/undefined code', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        referralCode: 'MINE',
@@ -560,8 +552,6 @@ index 0000000..263e927
 +    });
 +
 +    it('404 when caller customer is missing', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue(null);
 +      await expect(
 +        (service as any).redeemReferral('missing', 'CODE'),
@@ -569,8 +559,6 @@ index 0000000..263e927
 +    });
 +
 +    it('409 when already referred', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        referralCode: 'MINE',
@@ -589,8 +577,6 @@ index 0000000..263e927
 +    });
 +
 +    it('409 when redeeming own code', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        referralCode: 'OWN',
@@ -602,8 +588,6 @@ index 0000000..263e927
 +    });
 +
 +    it('404 referral_not_found for unknown code', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique
 +        .mockResolvedValueOnce({
 +          id: 'c1',
@@ -623,8 +607,6 @@ index 0000000..263e927
 +    });
 +
 +    it('409 when concurrent redeem already set referredById inside transaction', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique
 +        .mockResolvedValueOnce({
 +          id: 'c1',
@@ -644,8 +626,6 @@ index 0000000..263e927
 +    });
 +
 +    it('second redeem by same caller always not eligible', async () => {
-+      if (typeof (service as any).redeemReferral !== 'function') return;
-+
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        referralCode: 'MINE',
@@ -669,13 +649,10 @@ index 0000000..263e927
 +      });
 +
 +      const profile = await service.findOne('c1');
-+      if (profile && 'referralCount' in profile) {
-+        expect((profile as any).referralCount).toBe(4);
-+        expect((profile as any).totalLoyaltyPoints).toBe(250);
-+        expect((profile as any)._count).toBeUndefined();
-+      } else {
-+        expect(profile).toBeTruthy();
-+      }
++      expect(profile).toBeTruthy();
++      expect(profile).toHaveProperty('referralCount', 4);
++      expect(profile).toHaveProperty('totalLoyaltyPoints', 250);
++      expect((profile as any)._count).toBeUndefined();
 +    });
 +
 +    it('defaults referralCount to 0 when none', async () => {
@@ -686,9 +663,7 @@ index 0000000..263e927
 +      });
 +
 +      const profile = await service.findOne('c1');
-+      if (profile && 'referralCount' in profile) {
-+        expect((profile as any).referralCount).toBe(0);
-+      }
++      expect(profile).toHaveProperty('referralCount', 0);
 +    });
 +  });
 +});
