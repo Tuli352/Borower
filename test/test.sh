@@ -103,14 +103,15 @@ PY
 mkdir -p /logs/verifier
 
 # Anti-cheat: force a clean, isolated Jest run.
-# - Ignore any committed jest.config.* or package.json "jest" key that might
-#   install a custom reporter / testResultsProcessor that rewrites the JSON.
-# - Use only the built-in JSON reporter and a temporary minimal config.
-JEST_ISOLATED_CONFIG=$(mktemp /tmp/jest-isolated-XXXXXX.json)
-cat > "$JEST_ISOLATED_CONFIG" <<'EOF'
+# Write the config under /app so relative rootDir "src" resolves correctly
+# (a config in /tmp makes Jest look for /tmp/src).
+# Disable custom reporters / testResultsProcessor / global hooks that could
+# rewrite the JSON report.
+JEST_ISOLATED_CONFIG="/app/.jest-isolated-verifier.json"
+cat > "$JEST_ISOLATED_CONFIG" <<EOF
 {
   "moduleFileExtensions": ["js", "json", "ts"],
-  "rootDir": "src",
+  "rootDir": "/app/src",
   "testRegex": ".*\\.spec\\.ts$",
   "transform": { "^.+\\.(t|j)s$": "ts-jest" },
   "testEnvironment": "node",
