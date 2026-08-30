@@ -3,7 +3,6 @@
   "f2p_node_ids": [
     "Referral redemption (public behavior) route metadata.exposes POST profile/referral on the controller",
     "Referral redemption (public behavior) route metadata.marks the referral route for CUSTOMER AppContext",
-    "Referral redemption (public behavior) route metadata.declares HTTP 200 for successful redemption (not default 201)",
     "Referral redemption (public behavior) POST /customers/profile/referral.writes referredById and awards 100 points to referrer",
     "Referral redemption (public behavior) POST /customers/profile/referral.uses case-sensitive code match after trim",
     "Referral redemption (public behavior) POST /customers/profile/referral.404 when code differs only by case",
@@ -84,9 +83,6 @@
   "grade": {
     "format": "junit",
     "tool_label": "jest",
-    "reports": [
-      "/logs/verifier/base.xml",
-      "/logs/verifier/new.xml"
-    ]
+    "reports": ["/logs/verifier/base.xml", "/logs/verifier/new.xml"]
   }
 }
