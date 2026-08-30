@@ -1,18 +1,33 @@
-Customers already store a unique referral code and an optional referred-by link, but nothing lets a signed-in customer claim someone else's code after signup or see referral stats.
+Customers already store a unique referral code and an optional referred-by link, but a signed-in customer cannot yet claim someone else's code after signup or see how many people they referred.
 
-Add POST /customers/profile/referral for authenticated customers (AppContext = CUSTOMER). Body JSON must include string field `code`, validated with a DTO using class-validator `@IsString()` and `@IsNotEmpty()`.
+### Endpoint
 
-Success (200): after trimming whitespace (case-sensitive match) the code belongs to another customer and the caller has never been referred. Set the caller's referredById, add 100 to the referrer's totalLoyaltyPoints, return `{ "referredById": "<id>", "pointsAwarded": 100 }`.
+Add `POST /customers/profile/referral` for authenticated customers (`AppContext` = CUSTOMER).
 
-Errors (response body includes `error`):
-- empty/whitespace-only code after trim → 400, `invalid_referral_code`
-- unknown code → 404, `referral_not_found`
-- already referred or own code → 409, `referral_not_eligible`
+Request body is JSON with a string field `code`. Validate it with a class-validator DTO that uses `@IsString()` and `@IsNotEmpty()`. Put that DTO at `src/customers/dto/redeem-referral.dto.ts` and export the class as `RedeemReferralDto`.
 
-A second redeem by the same caller must return 409 and award no points. Concurrent claims must not double-award (re-check referredById inside a transaction before write).
+### Success (HTTP 200)
 
-Enrich GET /customers/profile with `referralCount` and `totalLoyaltyPoints` (default 0). Other existing flows stay unchanged.
+Trim leading and trailing whitespace from `code`. Matching is case-sensitive. If the code belongs to another customer and the caller has never been referred (`referredById` is null):
 
-Wire the route on CustomersController to your service layer however you like; structure is free as long as the HTTP contract and profile fields hold.
+1. Set the caller's `referredById` to the referrer's id.
+2. Add 100 to the referrer's `totalLoyaltyPoints`.
+3. Return `{ "referredById": "<referrer id>", "pointsAwarded": 100 }`.
+
+### Errors
+
+Include an `error` field in the JSON body:
+
+- Empty or whitespace-only code after trim → 400, `invalid_referral_code`
+- No customer owns the code → 404, `referral_not_found`
+- Caller already referred, or the code is the caller's own code → 409, `referral_not_eligible`
+
+A second redeem by the same caller must return 409 and must not award points again. Concurrent claims must not double-award; re-check `referredById` inside a transaction before writing.
+
+### Profile
+
+Enrich `GET /customers/profile` so the response always includes `referralCount` and `totalLoyaltyPoints` (use 0 when the stored points value is missing).
+
+Existing non-referral flows must keep working. Internal helpers are optional; the route, DTO path above, and profile fields are required.
 
 IMPORTANT: Work on a new branch from main and commit when done.
