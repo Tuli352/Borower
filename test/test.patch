@@ -44,8 +44,6 @@ index 0000000..a527a90
 +      $transaction: jest.fn((fn) => fn(prisma)),
 +    };
 +
-+    // ReferralService may or may not exist depending on solution apply;
-+    // provide a minimal stub so the module can compile when the solution is present.
 +    const referralStub = {
 +      redeem: jest.fn(),
 +      loadProfileWithReferralSummary: jest.fn(async (id: string) => {
@@ -61,13 +59,12 @@ index 0000000..a527a90
 +      { provide: PrismaService, useValue: prisma },
 +    ];
 +
-+    // Dynamically include ReferralService token if the class is available
 +    try {
 +      // eslint-disable-next-line @typescript-eslint/no-var-requires
 +      const { ReferralService } = require('./referral.service');
 +      providers.push({ provide: ReferralService, useValue: referralStub });
 +    } catch {
-+      // base commit: no ReferralService — CustomersService only needs PrismaService
++      // base commit: no ReferralService
 +    }
 +
 +    const module: TestingModule = await Test.createTestingModule({
@@ -397,16 +394,13 @@ index 0000000..a527a90
 +});
 diff --git a/src/customers/referral.behavior.spec.ts b/src/customers/referral.behavior.spec.ts
 new file mode 100644
-index 0000000..b8e4c2d
+index 0000000..c9f1a2b
 --- /dev/null
 +++ b/src/customers/referral.behavior.spec.ts
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,268 @@
 +/**
 + * Behavioral tests for the referral redemption feature.
-+ * These assert only the public contract described in instruction.md:
-+ * - CustomersService.redeemReferral (the method the controller calls)
-+ * - Enriched profile from findOne / GET /customers/profile
-+ * No private helper names, no required internal module structure.
++ * Asserts only the public contract from instruction.md.
 + */
 +import { Test, TestingModule } from '@nestjs/testing';
 +import {
@@ -432,7 +426,11 @@ index 0000000..b8e4c2d
 +        delete: jest.fn(),
 +      },
 +      account: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
-+      savedLocation: { create: jest.fn(), findMany: jest.fn(), delete: jest.fn() },
++      savedLocation: {
++        create: jest.fn(),
++        findMany: jest.fn(),
++        delete: jest.fn(),
++      },
 +      transaction: { findMany: jest.fn() },
 +      $transaction: jest.fn((fn) => fn(prisma)),
 +    };
@@ -442,7 +440,6 @@ index 0000000..b8e4c2d
 +      { provide: PrismaService, useValue: prisma },
 +    ];
 +
-+    // Optional ReferralService — present only after solution is applied
 +    try {
 +      const { ReferralService } = require('./referral.service');
 +      providers.push(ReferralService);
@@ -457,10 +454,10 @@ index 0000000..b8e4c2d
 +    service = module.get(CustomersService);
 +  });
 +
-+ describe('redeemReferral success', () => {
++  describe('redeemReferral success', () => {
 +    it('links referee and awards 100 points to referrer', async () => {
 +      if (typeof (service as any).redeemReferral !== 'function') {
-+        return; // skip on base (f2p expected to fail)
++        return;
 +      }
 +
 +      const me = {
@@ -477,11 +474,14 @@ index 0000000..b8e4c2d
 +      prisma.customer.findUnique
 +        .mockResolvedValueOnce(me)
 +        .mockResolvedValueOnce(referrer)
-+        .mockResolvedValueOnce(me); // re-check inside transaction
++        .mockResolvedValueOnce(me);
 +
 +      prisma.customer.update.mockResolvedValue({});
 +
-+      const result = await (service as any).redeemReferral('c-new', '  REFCODE  ');
++      const result = await (service as any).redeemReferral(
++        'c-new',
++        '  REFCODE  ',
++      );
 +      expect(result).toEqual({
 +        referredById: 'c-ref',
 +        pointsAwarded: 100,
@@ -659,7 +659,6 @@ index 0000000..b8e4c2d
 +
 +  describe('profile enrichment (GET /customers/profile)', () => {
 +    it('includes referralCount and totalLoyaltyPoints', async () => {
-+      // After solution, findOne (or its delegate) should attach the fields
 +      prisma.customer.findUnique.mockResolvedValue({
 +        id: 'c1',
 +        name: 'Ada',
@@ -675,7 +674,6 @@ index 0000000..b8e4c2d
 +        expect((profile as any).totalLoyaltyPoints).toBe(250);
 +        expect((profile as any)._count).toBeUndefined();
 +      } else {
-+        // On base commit the fields are absent — f2p will fail as expected
 +        expect(profile).toBeTruthy();
 +      }
 +    });
