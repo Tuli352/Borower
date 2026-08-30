@@ -397,7 +397,7 @@ new file mode 100644
 index 0000000..266881b
 --- /dev/null
 +++ b/src/customers/referral.behavior.spec.ts
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,306 @@
 +/**
 + * Public-contract tests for referral redemption.
 + * Outcomes only: controller return values, Nest exceptions, DTO validation,
