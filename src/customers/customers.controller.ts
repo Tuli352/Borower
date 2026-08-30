@@ -1,9 +1,33 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Request, UnauthorizedException, ForbiddenException, NotFoundException, BadRequestException, Query } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  UseGuards,
+  Request,
+  UnauthorizedException,
+  ForbiddenException,
+  NotFoundException,
+  BadRequestException,
+  Query,
+  HttpCode,
+  HttpStatus,
+} from '@nestjs/common';
 import { CustomersService } from './customers.service';
 import { AuthGuard } from '@nestjs/passport';
-import { ApiTags, ApiOperation, ApiBearerAuth, ApiParam, ApiBody } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiBearerAuth,
+  ApiParam,
+  ApiBody,
+} from '@nestjs/swagger';
 import { AppContext } from '../auth/decorators/app-context.decorator';
 import { AppType } from '../auth/dto/auth-context.dto';
+import { RedeemReferralDto } from './dto/redeem-referral.dto';
 
 @ApiBearerAuth()
 @Controller('customers')
@@ -12,7 +36,7 @@ export class CustomersController {
 
   @ApiTags('Admin')
   @ApiOperation({ summary: '[Admin] Create a new customer' })
-  @UseGuards(AuthGuard('jwt')) // Admin auth should be handled by a specific AdminGuard later
+  @UseGuards(AuthGuard('jwt'))
   @Post()
   async create(@Body() data: { accountId?: string } & any) {
     const { accountId, ...rest } = data;
@@ -41,6 +65,19 @@ export class CustomersController {
   @Patch('profile')
   async updateProfile(@Request() req: any, @Body() updateData: any) {
     return this.customersService.update(req.user.profileId, updateData);
+  }
+
+  @ApiTags('Customer App')
+  @ApiOperation({ summary: '[Customer] Redeem a referral code' })
+  @ApiBody({ type: RedeemReferralDto })
+  @AppContext(AppType.CUSTOMER)
+  @Post('profile/referral')
+  @HttpCode(HttpStatus.OK)
+  async redeemReferral(@Request() req: any, @Body() body: RedeemReferralDto) {
+    return this.customersService.redeemReferral(
+      req.user.profileId,
+      body?.code,
+    );
   }
 
   @ApiTags('Customer App')
@@ -87,8 +124,16 @@ export class CustomersController {
   @ApiOperation({ summary: '[Customer] Wallet transactions' })
   @AppContext(AppType.CUSTOMER)
   @Get('wallet/transactions')
-  async getWalletTransactions(@Request() req: any, @Query('limit') limit: string, @Query('page') page: string) {
-    return this.customersService.getWalletTransactions(req.user.profileId, Number(limit || 50), Number(page || 1));
+  async getWalletTransactions(
+    @Request() req: any,
+    @Query('limit') limit: string,
+    @Query('page') page: string,
+  ) {
+    return this.customersService.getWalletTransactions(
+      req.user.profileId,
+      Number(limit || 50),
+      Number(page || 1),
+    );
   }
 
   @ApiTags('Admin')
