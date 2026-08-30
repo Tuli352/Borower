@@ -102,15 +102,79 @@ PY
 
 mkdir -p /logs/verifier
 
+# Anti-cheat: run Jest under a verifier-owned config so agent-editable
+# package.json "jest" keys / jest.config.* / testResultsProcessor cannot
+# rewrite the JSON report that grading trusts.
+JEST_CFG=/logs/verifier/jest.isolated.json
+python3 - "$JEST_CFG" <<'PY'
+import json, sys
+cfg = {
+    "moduleFileExtensions": ["js", "json", "ts"],
+    "rootDir": "/app/src",
+    "testRegex": ".*\\.spec\\.ts$",
+    "transform": {"^.+\\.(t|j)s$": "ts-jest"},
+    "testEnvironment": "node",
+    "reporters": ["default"],
+    "testResultsProcessor": None,
+    "globalSetup": None,
+    "globalTeardown": None,
+    "setupFiles": [],
+    "setupFilesAfterEnv": [],
+    "haste": {"forceNodeFilesystemAPI": True},
+}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(cfg, f)
+PY
+
+# Neutralize project Jest config for the duration of the runs
+PKG_BAK=
+if [ -f package.json ]; then
+  PKG_BAK=$(mktemp /tmp/pkg-bak-XXXXXX.json)
+  cp package.json "$PKG_BAK"
+  python3 - <<'PY'
+import json
+with open("package.json", "r", encoding="utf-8") as f:
+    pkg = json.load(f)
+pkg.pop("jest", None)
+with open("package.json", "w", encoding="utf-8") as f:
+    json.dump(pkg, f, indent=2)
+    f.write("\n")
+PY
+fi
+for jc in jest.config.js jest.config.ts jest.config.cjs jest.config.mjs jest.config.json; do
+  if [ -f "$jc" ]; then
+    mv "$jc" "/tmp/${jc}.verifier-bak" 2>/dev/null || true
+  fi
+done
+
+restore_jest_env() {
+  if [ -n "${PKG_BAK:-}" ] && [ -f "$PKG_BAK" ]; then
+    mv -f "$PKG_BAK" package.json 2>/dev/null || true
+  fi
+  for jc in jest.config.js jest.config.ts jest.config.cjs jest.config.mjs jest.config.json; do
+    if [ -f "/tmp/${jc}.verifier-bak" ]; then
+      mv -f "/tmp/${jc}.verifier-bak" "$jc" 2>/dev/null || true
+    fi
+  done
+}
+trap 'restore_jest_env; if [ ! -f /logs/verifier/reward.json ] && [ ! -f /logs/verifier/reward.txt ]; then mkdir -p /logs/verifier; echo -1 > /logs/verifier/reward.txt; fi' EXIT
+
 # P2P: only customers.regression (green on base and with solution).
-# Do NOT run the stock Nest scaffold specs — several are already red on main
-# (Hello Kogi vs Hello World, missing DI mocks) and cannot be pass-to-pass.
-run_log npx jest --ci --testPathPatterns='customers\.regression\.spec' --json --outputFile=/logs/verifier/base.jest.json
+# Stock Nest scaffold specs are excluded (Hello Kogi / missing DI mocks on main).
+run_log npx jest --ci --config "$JEST_CFG" \
+  --testPathPatterns='customers\.regression\.spec' \
+  --json --outputFile=/logs/verifier/base.jest.json \
+  --no-cache --forceExit
 jest_json_to_junit /logs/verifier/base.jest.json /logs/verifier/base.xml
 
 # F2P: public-behavior referral suite (fail on base, pass with solution)
-run_log npx jest --ci --testPathPatterns='referral\.behavior\.spec' --json --outputFile=/logs/verifier/new.jest.json
+run_log npx jest --ci --config "$JEST_CFG" \
+  --testPathPatterns='referral\.behavior\.spec' \
+  --json --outputFile=/logs/verifier/new.jest.json \
+  --no-cache --forceExit
 jest_json_to_junit /logs/verifier/new.jest.json /logs/verifier/new.xml
+
+restore_jest_env
 
 set -e
 # >>> END RUN TESTS <<<
@@ -136,7 +200,7 @@ log "reward.json=$(cat /logs/verifier/reward.json 2>/dev/null)"
 mkdir -p /logs/verifier/reports 2>/dev/null
 for _f in /logs/verifier/*; do
   case "${_f##*/}" in
-    reward.json|reward.txt|ctrf.json|run.log|test-stdout.txt|reports) continue ;;
+    reward.json|reward.txt|ctrf.json|run.log|test-stdout.txt|reports|jest.isolated.json) continue ;;
   esac
   [ -f "$_f" ] && mv -f "$_f" /logs/verifier/reports/ 2>/dev/null
 done
