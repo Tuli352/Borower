@@ -1,10 +1,13 @@
 /**
  * Public-contract tests for referral redemption.
- * Focus on observable outcomes: status metadata, response body, exceptions,
- * DTO validation, AppContext, profile enrichment, and concurrency safety.
- * Avoids asserting exact Prisma call sequences so alternate correct
- * implementations (atomic updateMany, locks, raw SQL, different helpers)
- * remain acceptable.
+ *
+ * Assert observable outcomes only: HTTP metadata, response bodies, Nest
+ * exceptions, DTO validation, AppContext, side-effects on customer state
+ * (referredById link + totalLoyaltyPoints), and concurrent double-award
+ * safety. Persistence is an in-memory store that accepts multiple valid
+ * Prisma shapes (findUnique/findFirst, update/updateMany, $transaction
+ * callback or array, count or _count include) so alternate correct
+ * implementations are not rejected for dependency shape.
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import {
@@ -25,11 +28,154 @@ import { CustomersService } from './customers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppType } from '../auth/dto/auth-context.dto';
 
+/** Behavioral in-memory customer store + Prisma-compatible facade. */
+function createBehavioralStore(seed: Record<string, any>) {
+  const rows: Record<string, any> = {};
+  for (const [id, row] of Object.entries(seed)) {
+    rows[id] = { ...row };
+  }
+
+  const findBy = (where: any) => {
+    if (!where) return null;
+    if (where.id != null) {
+      return rows[where.id] ? { ...rows[where.id] } : null;
+    }
+    if (where.referralCode != null) {
+      const found = Object.values(rows).find(
+        (c: any) => c.referralCode === where.referralCode,
+      );
+      return found ? { ...found } : null;
+    }
+    return null;
+  };
+
+  const applyData = (row: any, data: any) => {
+    if (!data) return;
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'increment' in (val as any)) {
+        row[key] = (row[key] || 0) + (val as any).increment;
+      } else if (val && typeof val === 'object' && 'set' in (val as any)) {
+        row[key] = (val as any).set;
+      } else {
+        row[key] = val;
+      }
+    }
+  };
+
+  const customerApi = {
+    findUnique: jest.fn(async (args: any) => {
+      const row = findBy(args?.where);
+      if (!row) return null;
+      if (args?.include?._count?.select?.referrals) {
+        const count = Object.values(rows).filter(
+          (c: any) => c.referredById === row.id,
+        ).length;
+        return { ...row, _count: { referrals: count } };
+      }
+      if (args?.include) {
+        const extra: any = {};
+        if (args.include.orders) extra.orders = [];
+        if (args.include.transactions) extra.transactions = [];
+        return { ...row, ...extra };
+      }
+      if (args?.select) {
+        const picked: any = {};
+        for (const k of Object.keys(args.select)) {
+          if (k === '_count' && args.select._count?.select?.referrals) {
+            picked._count = {
+              referrals: Object.values(rows).filter(
+                (c: any) => c.referredById === row.id,
+              ).length,
+            };
+          } else if (args.select[k]) {
+            picked[k] = row[k];
+          }
+        }
+        return picked;
+      }
+      return row;
+    }),
+    findFirst: jest.fn(async (args: any) => findBy(args?.where)),
+    update: jest.fn(async (args: any) => {
+      const id = args?.where?.id;
+      if (!id || !rows[id]) {
+        throw Object.assign(new Error('Record to update not found.'), {
+          code: 'P2025',
+        });
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(args.where, 'referredById') &&
+        rows[id].referredById !== args.where.referredById
+      ) {
+        throw Object.assign(new Error('Record to update not found.'), {
+          code: 'P2025',
+        });
+      }
+      applyData(rows[id], args.data);
+      return { ...rows[id] };
+    }),
+    updateMany: jest.fn(async (args: any) => {
+      let count = 0;
+      for (const row of Object.values(rows) as any[]) {
+        let match = true;
+        if (args?.where) {
+          for (const [k, v] of Object.entries(args.where)) {
+            if (row[k] !== v) {
+              match = false;
+              break;
+            }
+          }
+        }
+        if (match) {
+          applyData(row, args.data);
+          count += 1;
+        }
+      }
+      return { count };
+    }),
+    count: jest.fn(async (args: any) => {
+      let list = Object.values(rows) as any[];
+      if (args?.where) {
+        list = list.filter((row) => {
+          for (const [k, v] of Object.entries(args.where)) {
+            if (row[k] !== v) return false;
+          }
+          return true;
+        });
+      }
+      return list.length;
+    }),
+    findMany: jest.fn(async () => Object.values(rows).map((r) => ({ ...r }))),
+    create: jest.fn(),
+    delete: jest.fn(),
+  };
+
+  const runInteractive = async (fn: any) => fn(prismaFacade);
+
+  const prismaFacade: any = {
+    customer: customerApi,
+    account: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
+    savedLocation: {
+      create: jest.fn(),
+      findMany: jest.fn(),
+      delete: jest.fn(),
+    },
+    transaction: { findMany: jest.fn() },
+    $transaction: jest.fn(async (arg: any) => {
+      if (Array.isArray(arg)) {
+        return Promise.all(arg);
+      }
+      return runInteractive(arg);
+    }),
+  };
+
+  return { rows, prisma: prismaFacade };
+}
+
 describe('Referral redemption (public behavior)', () => {
   let controller: CustomersController;
+  let rows: Record<string, any>;
   let prisma: any;
-  /** In-memory customer store so points increment & concurrent writes are observable */
-  let customers: Record<string, any>;
 
   const authed = (profileId: string) => ({ user: { profileId } });
 
@@ -74,84 +220,10 @@ describe('Referral redemption (public behavior)', () => {
     return null;
   }
 
-  beforeEach(async () => {
-    customers = {
-      'c-new': {
-        id: 'c-new',
-        referralCode: 'NEWCODE',
-        referredById: null,
-        totalLoyaltyPoints: 0,
-      },
-      'c-ref': {
-        id: 'c-ref',
-        referralCode: 'REFCODE',
-        referredById: null,
-        totalLoyaltyPoints: 10,
-      },
-      c1: {
-        id: 'c1',
-        referralCode: 'MINE',
-        referredById: null,
-        totalLoyaltyPoints: 0,
-      },
-      r1: {
-        id: 'r1',
-        referralCode: 'AbC',
-        referredById: null,
-        totalLoyaltyPoints: 5,
-      },
-    };
-
-    prisma = {
-      customer: {
-        findUnique: jest.fn(async (args: any) => {
-          if (args?.where?.id) {
-            return customers[args.where.id]
-              ? { ...customers[args.where.id] }
-              : null;
-          }
-          if (args?.where?.referralCode != null) {
-            const code = args.where.referralCode;
-            const found = Object.values(customers).find(
-              (c: any) => c.referralCode === code,
-            );
-            return found ? { ...found } : null;
-          }
-          return null;
-        }),
-        update: jest.fn(async (args: any) => {
-          const id = args.where.id;
-          const row = customers[id];
-          if (!row) {
-            throw Object.assign(new Error('not found'), { code: 'P2025' });
-          }
-          const data = args.data || {};
-          if (data.referredById !== undefined) {
-            row.referredById = data.referredById;
-          }
-          if (data.totalLoyaltyPoints?.increment != null) {
-            row.totalLoyaltyPoints =
-              (row.totalLoyaltyPoints || 0) +
-              data.totalLoyaltyPoints.increment;
-          } else if (typeof data.totalLoyaltyPoints === 'number') {
-            row.totalLoyaltyPoints = data.totalLoyaltyPoints;
-          }
-          return { ...row };
-        }),
-        count: jest.fn(),
-        findMany: jest.fn(),
-        create: jest.fn(),
-        delete: jest.fn(),
-      },
-      account: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
-      savedLocation: {
-        create: jest.fn(),
-        findMany: jest.fn(),
-        delete: jest.fn(),
-      },
-      transaction: { findMany: jest.fn() },
-      $transaction: jest.fn(async (fn: any) => fn(prisma)),
-    };
+  async function boot(seed: Record<string, any>) {
+    const store = createBehavioralStore(seed);
+    rows = store.rows;
+    prisma = store.prisma;
 
     const providers: any[] = [
       CustomersService,
@@ -170,6 +242,39 @@ describe('Referral redemption (public behavior)', () => {
     }).compile();
 
     controller = module.get(CustomersController);
+  }
+
+  beforeEach(async () => {
+    await boot({
+      'c-new': {
+        id: 'c-new',
+        referralCode: 'NEWCODE',
+        referredById: null,
+        totalLoyaltyPoints: 0,
+        name: 'New',
+      },
+      'c-ref': {
+        id: 'c-ref',
+        referralCode: 'REFCODE',
+        referredById: null,
+        totalLoyaltyPoints: 10,
+        name: 'Referrer',
+      },
+      c1: {
+        id: 'c1',
+        referralCode: 'MINE',
+        referredById: null,
+        totalLoyaltyPoints: 0,
+        name: 'Self',
+      },
+      r1: {
+        id: 'r1',
+        referralCode: 'AbC',
+        referredById: null,
+        totalLoyaltyPoints: 5,
+        name: 'Case',
+      },
+    });
   });
 
   describe('route metadata & HTTP 200', () => {
@@ -197,31 +302,41 @@ describe('Referral redemption (public behavior)', () => {
   });
 
   describe('POST /customers/profile/referral success', () => {
-    it('links referee, awards exactly 100 points to referrer, returns body', async () => {
-      const beforePoints = customers['c-ref'].totalLoyaltyPoints;
+    it('links referee to referrer, awards exactly 100 points to that referrer, returns body', async () => {
+      const beforeRefPoints = rows['c-ref'].totalLoyaltyPoints;
+      const beforeNewPoints = rows['c-new'].totalLoyaltyPoints;
+
       const result = await postReferralHandler()(authed('c-new'), {
         code: '  REFCODE  ',
       });
+
       expect(result).toEqual({
         referredById: 'c-ref',
         pointsAwarded: 100,
       });
-      expect(customers['c-ref'].totalLoyaltyPoints).toBe(beforePoints + 100);
-      expect(customers['c-new'].referredById).toBe('c-ref');
+
+      // Referee linked to the correct referrer
+      expect(rows['c-new'].referredById).toBe('c-ref');
+
+      // Referrer (not referee) received +100
+      expect(rows['c-ref'].totalLoyaltyPoints).toBe(beforeRefPoints + 100);
+      expect(rows['c-new'].totalLoyaltyPoints).toBe(beforeNewPoints);
+
+      expect(rows.r1.totalLoyaltyPoints).toBe(5);
+      expect(rows.c1.referredById).toBeNull();
     });
 
     it('uses case-sensitive code match after trim', async () => {
       const result = await postReferralHandler()(authed('c1'), { code: 'AbC' });
-      expect(result).toEqual(
-        expect.objectContaining({
-          referredById: 'r1',
-          pointsAwarded: 100,
-        }),
-      );
-      expect(customers.r1.totalLoyaltyPoints).toBe(105);
+      expect(result).toEqual({
+        referredById: 'r1',
+        pointsAwarded: 100,
+      });
+      expect(rows.c1.referredById).toBe('r1');
+      expect(rows.r1.totalLoyaltyPoints).toBe(105);
     });
 
-    it('404 for case-mismatched lookup (ABC vs AbC)', async () => {
+    it('404 for case-mismatched lookup (ABC vs stored AbC) and awards nothing', async () => {
       await expect(
         postReferralHandler()(authed('c1'), { code: 'ABC' }),
       ).rejects.toBeInstanceOf(NotFoundException);
@@ -231,8 +346,8 @@ describe('Referral redemption (public behavior)', () => {
         const body = e.getResponse?.() ?? e.response ?? e.message;
         expect(JSON.stringify(body)).toMatch(/referral_not_found/);
       }
-      expect(customers.r1.totalLoyaltyPoints).toBe(5);
-      expect(customers.c1.referredById).toBeNull();
+      expect(rows.r1.totalLoyaltyPoints).toBe(5);
+      expect(rows.c1.referredById).toBeNull();
     });
   });
 
@@ -247,10 +362,11 @@ describe('Referral redemption (public behavior)', () => {
         const body = e.getResponse?.() ?? e.response ?? e.message;
         expect(JSON.stringify(body)).toMatch(/invalid_referral_code/);
       }
+      expect(rows.c1.referredById).toBeNull();
     });
 
-    it('409 when already referred', async () => {
-      customers.c1.referredById = 'already';
+    it('409 when already referred; no points awarded', async () => {
+      rows.c1.referredById = 'already';
       await expect(
         postReferralHandler()(authed('c1'), { code: 'AbC' }),
       ).rejects.toBeInstanceOf(ConflictException);
@@ -260,13 +376,15 @@ describe('Referral redemption (public behavior)', () => {
         const body = e.getResponse?.() ?? e.response ?? e.message;
         expect(JSON.stringify(body)).toMatch(/referral_not_eligible/);
       }
-      expect(customers.r1.totalLoyaltyPoints).toBe(5);
+      expect(rows.r1.totalLoyaltyPoints).toBe(5);
     });
 
     it('409 when redeeming own code', async () => {
       await expect(
         postReferralHandler()(authed('c1'), { code: 'MINE' }),
       ).rejects.toBeInstanceOf(ConflictException);
+      expect(rows.c1.referredById).toBeNull();
+      expect(rows.c1.totalLoyaltyPoints).toBe(0);
     });
 
     it('404 referral_not_found for unknown code', async () => {
@@ -278,58 +396,62 @@ describe('Referral redemption (public behavior)', () => {
         const body = e.getResponse?.() ?? e.response ?? e.message;
         expect(JSON.stringify(body)).toMatch(/referral_not_found/);
       }
+      expect(rows.c1.referredById).toBeNull();
     });
 
     it('second redeem by same caller returns 409 and does not award again', async () => {
       await postReferralHandler()(authed('c-new'), { code: 'REFCODE' });
-      const pointsAfterFirst = customers['c-ref'].totalLoyaltyPoints;
+      expect(rows['c-new'].referredById).toBe('c-ref');
+      const pointsAfterFirst = rows['c-ref'].totalLoyaltyPoints;
+
       await expect(
         postReferralHandler()(authed('c-new'), { code: 'REFCODE' }),
       ).rejects.toBeInstanceOf(ConflictException);
-      expect(customers['c-ref'].totalLoyaltyPoints).toBe(pointsAfterFirst);
+
+      expect(rows['c-ref'].totalLoyaltyPoints).toBe(pointsAfterFirst);
+      expect(rows['c-new'].referredById).toBe('c-ref');
     });
   });
 
   describe('concurrent double-award prevention', () => {
-    it('only one claim awards points; second returns 409', async () => {
-      customers['c-a'] = {
+    it('two concurrent claims by same referee: exactly one succeeds, points awarded once', async () => {
+      rows['c-a'] = {
         id: 'c-a',
         referralCode: 'CA',
         referredById: null,
         totalLoyaltyPoints: 0,
       };
-      const startPoints = customers['c-ref'].totalLoyaltyPoints;
+      const startPoints = rows['c-ref'].totalLoyaltyPoints;
 
-      await postReferralHandler()(authed('c-a'), { code: 'REFCODE' });
-      await expect(
+      const results = await Promise.allSettled([
         postReferralHandler()(authed('c-a'), { code: 'REFCODE' }),
-      ).rejects.toBeInstanceOf(ConflictException);
+        postReferralHandler()(authed('c-a'), { code: 'REFCODE' }),
+      ]);
 
-      expect(customers['c-ref'].totalLoyaltyPoints).toBe(startPoints + 100);
-      expect(customers['c-a'].referredById).toBe('c-ref');
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+
+      expect(fulfilled.length).toBe(1);
+      expect(rejected.length).toBe(1);
+      expect((fulfilled[0] as PromiseFulfilledResult<any>).value).toEqual({
+        referredById: 'c-ref',
+        pointsAwarded: 100,
+      });
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(rows['c-ref'].totalLoyaltyPoints).toBe(startPoints + 100);
+      expect(rows['c-a'].referredById).toBe('c-ref');
     });
 
-    it('re-check inside transaction rejects when referredById already set', async () => {
-      let reads = 0;
-      prisma.customer.findUnique.mockImplementation(async (args: any) => {
-        if (args?.where?.referralCode === 'REFCODE') {
-          return { ...customers['c-ref'] };
-        }
-        if (args?.where?.id === 'c-new') {
-          reads += 1;
-          if (reads > 1) {
-            return {
-              ...customers['c-new'],
-              referredById: 'race-winner',
-            };
-          }
-          return { ...customers['c-new'] };
-        }
-        return null;
-      });
+    it('serial second claim after first still 409 with no extra points', async () => {
+      const startPoints = rows['c-ref'].totalLoyaltyPoints;
+      await postReferralHandler()(authed('c-new'), { code: 'REFCODE' });
       await expect(
         postReferralHandler()(authed('c-new'), { code: 'REFCODE' }),
       ).rejects.toBeInstanceOf(ConflictException);
+      expect(rows['c-ref'].totalLoyaltyPoints).toBe(startPoints + 100);
     });
   });
 
@@ -368,35 +490,38 @@ describe('Referral redemption (public behavior)', () => {
   });
 
   describe('GET /customers/profile enrichment', () => {
-    it('includes referralCount and totalLoyaltyPoints', async () => {
-      prisma.customer.findUnique.mockResolvedValue({
-        id: 'c1',
-        name: 'Ada',
-        totalLoyaltyPoints: 250,
-        orders: [],
-        transactions: [],
-        _count: { referrals: 4 },
-      });
-      const profile = await controller.getProfile(authed('c1') as any);
-      expect(profile).toHaveProperty('referralCount', 4);
+    /**
+     * Seed real referredById links. Assert public fields. Works whether the
+     * implementation uses _count include, customer.count(), or another aggregate.
+     */
+    it('includes referralCount from actual referrals and totalLoyaltyPoints', async () => {
+      rows['ref-a'] = {
+        id: 'ref-a',
+        referralCode: 'RA',
+        referredById: 'c-ref',
+        totalLoyaltyPoints: 0,
+      };
+      rows['ref-b'] = {
+        id: 'ref-b',
+        referralCode: 'RB',
+        referredById: 'c-ref',
+        totalLoyaltyPoints: 0,
+      };
+      rows['c-ref'].totalLoyaltyPoints = 250;
+
+      const profile = await controller.getProfile(authed('c-ref') as any);
+      expect(profile).toHaveProperty('referralCount', 2);
       expect(profile).toHaveProperty('totalLoyaltyPoints', 250);
     });
 
-    it('defaults referralCount to 0 when none', async () => {
-      prisma.customer.findUnique.mockResolvedValue({
-        id: 'c1',
-        totalLoyaltyPoints: 0,
-        _count: { referrals: 0 },
-      });
+    it('defaults referralCount to 0 when none referred', async () => {
+      rows.c1.totalLoyaltyPoints = 0;
       const profile = await controller.getProfile(authed('c1') as any);
       expect(profile).toHaveProperty('referralCount', 0);
     });
 
-    it('defaults totalLoyaltyPoints to 0 when absent', async () => {
-      prisma.customer.findUnique.mockResolvedValue({
-        id: 'c1',
-        _count: { referrals: 0 },
-      });
+    it('defaults totalLoyaltyPoints to 0 when stored value is missing', async () => {
+      delete rows.c1.totalLoyaltyPoints;
       const profile = await controller.getProfile(authed('c1') as any);
       expect(profile).toHaveProperty('totalLoyaltyPoints', 0);
     });
