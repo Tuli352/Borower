@@ -1,0 +1,688 @@
+-diff --git a/src/customers/customers.controller.ts b/src/customers/customers.controller.ts
+index a4587fb..43ed4bb 100644
+--- a/src/customers/customers.controller.ts
++++ b/src/customers/customers.controller.ts
+@@ -1,9 +1,31 @@
+-import { Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Request, UnauthorizedException, ForbiddenException, NotFoundException, BadRequestException, Query } from '@nestjs/common';
++import {
++  Controller,
++  Get,
++  Post,
++  Body,
++  Patch,
++  Param,
++  Delete,
++  UseGuards,
++  Request,
++  UnauthorizedException,
++  ForbiddenException,
++  NotFoundException,
++  BadRequestException,
++  Query,
++} from '@nestjs/common';
+ import { CustomersService } from './customers.service';
+ import { AuthGuard } from '@nestjs/passport';
+-import { ApiTags, ApiOperation, ApiBearerAuth, ApiParam, ApiBody } from '@nestjs/swagger';
++import {
++  ApiTags,
++  ApiOperation,
++  ApiBearerAuth,
++  ApiParam,
++  ApiBody,
++} from '@nestjs/swagger';
+ import { AppContext } from '../auth/decorators/app-context.decorator';
+ import { AppType } from '../auth/dto/auth-context.dto';
++import { RedeemReferralDto } from './dto/redeem-referral.dto';
+ 
+ @ApiBearerAuth()
+ @Controller('customers')
+@@ -43,6 +65,18 @@ export class CustomersController {
+     return this.customersService.update(req.user.profileId, updateData);
+   }
+ 
++  @ApiTags('Customer App')
++  @ApiOperation({ summary: '[Customer] Redeem a referral code' })
++  @ApiBody({ type: RedeemReferralDto })
++  @AppContext(AppType.CUSTOMER)
++  @Post('profile/referral')
++  async redeemReferral(@Request() req: any, @Body() body: RedeemReferralDto) {
++    return this.customersService.redeemReferral(
++      req.user.profileId,
++      body?.code,
++    );
++  }
++
+   @ApiTags('Customer App')
+   @ApiOperation({ summary: '[Customer] Add a saved location' })
+   @AppContext(AppType.CUSTOMER)
+@@ -87,8 +121,16 @@ export class CustomersController {
+   @ApiOperation({ summary: '[Customer] Wallet transactions' })
+   @AppContext(AppType.CUSTOMER)
+   @Get('wallet/transactions')
+-  async getWalletTransactions(@Request() req: any, @Query('limit') limit: string, @Query('page') page: string) {
+-    return this.customersService.getWalletTransactions(req.user.profileId, Number(limit || 50), Number(page || 1));
++  async getWalletTransactions(
++    @Request() req: any,
++    @Query('limit') limit: string,
++    @Query('page') page: string,
++  ) {
++    return this.customersService.getWalletTransactions(
++      req.user.profileId,
++      Number(limit || 50),
++      Number(page || 1),
++    );
+   }
+ 
+   @ApiTags('Admin')
+diff --git a/src/customers/customers.module.ts b/src/customers/customers.module.ts
+index 0f591f2..113a9af 100644
+--- a/src/customers/customers.module.ts
++++ b/src/customers/customers.module.ts
+@@ -1,10 +1,11 @@
+ import { Module } from '@nestjs/common';
+ import { CustomersController } from './customers.controller';
+ import { CustomersService } from './customers.service';
++import { ReferralService } from './referral.service';
+ 
+ @Module({
+   controllers: [CustomersController],
+-  providers: [CustomersService],
+-  exports: [CustomersService]
++  providers: [CustomersService, ReferralService],
++  exports: [CustomersService, ReferralService],
+ })
+ export class CustomersModule {}
+diff --git a/src/customers/customers.service.ts b/src/customers/customers.service.ts
+index ad63b95..03b138f 100644
+--- a/src/customers/customers.service.ts
++++ b/src/customers/customers.service.ts
+@@ -1,15 +1,26 @@
+-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
++import {
++  Injectable,
++  BadRequestException,
++  NotFoundException,
++} from '@nestjs/common';
+ import { PrismaService } from '../prisma/prisma.service';
++import { ReferralService } from './referral.service';
+ 
+ @Injectable()
+ export class CustomersService {
+-  constructor(private prisma: PrismaService) {}
++  constructor(
++    private prisma: PrismaService,
++    private referralService: ReferralService,
++  ) {}
+ 
+   findAll() {
+     return this.prisma.customer.findMany({ orderBy: { createdAt: 'desc' } });
+   }
+ 
+-  async addSavedLocation(customerId: string, data: { name: string; address: string; latitude: number; longitude: number }) {
++  async addSavedLocation(
++    customerId: string,
++    data: { name: string; address: string; latitude: number; longitude: number },
++  ) {
+     return this.prisma.savedLocation.create({
+       data: {
+         customerId,
+@@ -36,13 +47,7 @@ export class CustomersService {
+ 
+   async findOne(id: string) {
+     try {
+-      return await this.prisma.customer.findUnique({
+-        where: { id },
+-        include: {
+-          orders: { orderBy: { createdAt: 'desc' } },
+-          transactions: { orderBy: { createdAt: 'desc' } },
+-        },
+-      });
++      return await this.referralService.loadProfileWithReferralSummary(id);
+     } catch (error: any) {
+       throw new BadRequestException(`Database lookup failed: ${error.message}`);
+     }
+@@ -54,12 +59,13 @@ export class CustomersService {
+ 
+   async create(data: any, accountId?: string) {
+     const { referralCode: codeUsed, phone, email, ...rest } = data;
+-    
+-    // 1. Resolve or Create Account if not provided
++
+     let effectiveAccountId = accountId;
+     if (!effectiveAccountId) {
+       if (!phone && !email) {
+-        throw new Error('Either accountId, phone, or email must be provided to create a customer profile');
++        throw new Error(
++          'Either accountId, phone, or email must be provided to create a customer profile',
++        );
+       }
+ 
+       let account = await this.prisma.account.findFirst({
+@@ -89,13 +95,13 @@ export class CustomersService {
+       effectiveAccountId = account.id;
+     }
+ 
+-    // 2. Generate unique code for the new user
+-    let newCode = this.generateReferralCode();
+-    
+-    // 3. Handle referrer if provided
++    const newCode = this.generateReferralCode();
++
+     let referredById = null;
+     if (codeUsed) {
+-      const referrer = await this.prisma.customer.findUnique({ where: { referralCode: codeUsed } });
++      const referrer = await this.prisma.customer.findUnique({
++        where: { referralCode: codeUsed },
++      });
+       if (referrer) {
+         referredById = referrer.id;
+       }
+@@ -108,8 +114,8 @@ export class CustomersService {
+         email,
+         account: { connect: { id: effectiveAccountId } },
+         referralCode: newCode,
+-        referredBy: referredById ? { connect: { id: referredById } } : undefined
+-      }
++        referredBy: referredById ? { connect: { id: referredById } } : undefined,
++      },
+     });
+   }
+ 
+@@ -121,7 +127,9 @@ export class CustomersService {
+       });
+     } catch (error: any) {
+       if (error.code === 'P2002') {
+-        throw new BadRequestException('This email is already in use by another customer.');
++        throw new BadRequestException(
++          'This email is already in use by another customer.',
++        );
+       }
+       if (error.code === 'P2025') {
+         throw new NotFoundException('Customer record not found.');
+@@ -142,7 +150,6 @@ export class CustomersService {
+   }
+ 
+   async subscribeToPlus(id: string) {
+-    // 1. Mark as plus member for 30 days
+     const expiry = new Date();
+     expiry.setDate(expiry.getDate() + 30);
+ 
+@@ -150,26 +157,35 @@ export class CustomersService {
+       where: { id: id },
+       data: {
+         isKogiPlus: true,
+-        plusExpiry: expiry
+-      }
++        plusExpiry: expiry,
++      },
+     });
+   }
+ 
+   async getWallet(id: string) {
+     const customer = await this.prisma.customer.findUnique({
+       where: { id },
+-      select: { walletBalance: true }
++      select: { walletBalance: true },
+     });
+     if (!customer) throw new NotFoundException('Customer not found');
+     return customer;
+   }
+ 
+-  async getWalletTransactions(id: string, limit: number = 50, page: number = 1) {
++  async getWalletTransactions(
++    id: string,
++    limit: number = 50,
++    page: number = 1,
++  ) {
+     return this.prisma.transaction.findMany({
+       where: { customerId: id },
+       orderBy: { createdAt: 'desc' },
+       take: limit,
+-      skip: (page - 1) * limit
++      skip: (page - 1) * limit,
+     });
+   }
++
++  /** Public entry used by the controller for POST /customers/profile/referral */
++  redeemReferral(customerId: string, rawCode: string | undefined | null) {
++    return this.referralService.redeem(customerId, rawCode);
++  }
+ }
+diff --git a/src/customers/dto/redeem-referral.dto.ts b/src/customers/dto/redeem-referral.dto.ts
+new file mode 100644
+index 0000000..dacaa71
+--- /dev/null
++++ b/src/customers/dto/redeem-referral.dto.ts
+@@ -0,0 +1,16 @@
++import { ApiProperty } from '@nestjs/swagger';
++import { IsString, IsNotEmpty } from 'class-validator';
++
++/**
++ * Body for POST /customers/profile/referral
++ * The code is trimmed server-side; whitespace-only is rejected as invalid.
++ */
++export class RedeemReferralDto {
++  @ApiProperty({
++    description: 'Referral code belonging to another customer',
++    example: 'ABC123',
++  })
++  @IsString()
++  @IsNotEmpty()
++  code!: string;
++}
+diff --git a/src/customers/referral.constants.ts b/src/customers/referral.constants.ts
+new file mode 100644
+index 0000000..819c8da
+--- /dev/null
++++ b/src/customers/referral.constants.ts
+@@ -0,0 +1,28 @@
++/**
++ * Fixed loyalty-point bonus granted to the referrer when a code is redeemed.
++ * Product can change this single value without touching service logic.
++ */
++export const REFERRAL_POINTS_AWARD = 100;
++
++/**
++ * Stable error codes returned in JSON bodies for referral redemption failures.
++ * Clients should match on these strings rather than HTTP status alone.
++ */
++export const ReferralError = {
++  /** Empty or whitespace-only code after trim */
++  INVALID: 'invalid_referral_code',
++  /** No customer owns the supplied code */
++  NOT_FOUND: 'referral_not_found',
++  /** Own code, already referred, or other business rule block */
++  NOT_ELIGIBLE: 'referral_not_eligible',
++} as const;
++
++export type ReferralErrorCode =
++  (typeof ReferralError)[keyof typeof ReferralError];
++
++/** HTTP status mapping used by the service when throwing Nest exceptions */
++export const ReferralHttpStatus: Record<ReferralErrorCode, number> = {
++  invalid_referral_code: 400,
++  referral_not_found: 404,
++  referral_not_eligible: 409,
++};
+diff --git a/src/customers/referral.service.ts b/src/customers/referral.service.ts
+new file mode 100644
+index 0000000..12fa7fe
+--- /dev/null
++++ b/src/customers/referral.service.ts
+@@ -0,0 +1,156 @@
++import {
++  Injectable,
++  BadRequestException,
++  NotFoundException,
++  ConflictException,
++} from '@nestjs/common';
++import { PrismaService } from '../prisma/prisma.service';
++import {
++  REFERRAL_POINTS_AWARD,
++  ReferralError,
++} from './referral.constants';
++import {
++  normalizeReferralCode,
++  precheckRedemptionEligibility,
++  postcheckReferrer,
++  buildRedeemSuccess,
++  attachReferralSummary,
++} from './referral.utils';
++
++/**
++ * Owns referral redemption and profile summary enrichment.
++ * Kept separate from the general CustomersService so the redemption
++ * transaction and eligibility rules stay in one place.
++ */
++@Injectable()
++export class ReferralService {
++  constructor(private readonly prisma: PrismaService) {}
++
++  /**
++   * Redeem `rawCode` for `customerId`. Awards REFERRAL_POINTS_AWARD to the
++   * referrer. Concurrent attempts for the same referee cannot double-award.
++   */
++  async redeem(
++    customerId: string,
++    rawCode: string | undefined | null,
++  ): Promise<{ referredById: string; pointsAwarded: number }> {
++    const code = normalizeReferralCode(rawCode);
++
++    const me = await this.prisma.customer.findUnique({
++      where: { id: customerId },
++    });
++    if (!me) {
++      throw new NotFoundException('Customer not found');
++    }
++
++    const early = precheckRedemptionEligibility({
++      code,
++      myReferralCode: me.referralCode,
++      myReferredById: me.referredById,
++    });
++    if (early === ReferralError.INVALID) {
++      throw new BadRequestException({ error: ReferralError.INVALID });
++    }
++    if (early === ReferralError.NOT_ELIGIBLE) {
++      throw new ConflictException({ error: ReferralError.NOT_ELIGIBLE });
++    }
++
++    const referrer = await this.prisma.customer.findUnique({
++      where: { referralCode: code },
++    });
++
++    const post = postcheckReferrer({
++      referrerId: referrer?.id,
++      callerId: customerId,
++    });
++    if (post === ReferralError.NOT_FOUND) {
++      throw new NotFoundException({ error: ReferralError.NOT_FOUND });
++    }
++    if (post === ReferralError.NOT_ELIGIBLE) {
++      throw new ConflictException({ error: ReferralError.NOT_ELIGIBLE });
++    }
++
++    const referrerId = referrer!.id;
++    const points = REFERRAL_POINTS_AWARD;
++
++    await this.prisma.$transaction(async (tx) => {
++      const current = await tx.customer.findUnique({
++        where: { id: customerId },
++      });
++      if (!current || current.referredById) {
++        throw new ConflictException({ error: ReferralError.NOT_ELIGIBLE });
++      }
++
++      await tx.customer.update({
++        where: { id: customerId },
++        data: { referredById: referrerId },
++      });
++
++      await tx.customer.update({
++        where: { id: referrerId },
++        data: { totalLoyaltyPoints: { increment: points } },
++      });
++    });
++
++    return buildRedeemSuccess(referrerId, points);
++  }
++
++  /**
++   * Load a customer and attach referralCount + totalLoyaltyPoints for the
++   * authenticated profile response.
++   */
++  async loadProfileWithReferralSummary(id: string) {
++    const customer = await this.prisma.customer.findUnique({
++      where: { id },
++      include: {
++        orders: { orderBy: { createdAt: 'desc' } },
++        transactions: { orderBy: { createdAt: 'desc' } },
++        _count: { select: { referrals: true } },
++      },
++    });
++    if (!customer) {
++      return null;
++    }
++    const { _count, ...rest } = customer as any;
++    return attachReferralSummary(rest, _count?.referrals ?? 0);
++  }
++
++  /**
++   * Count how many customers list `customerId` as their referrer.
++   * Used by admin tooling and tests; profile path uses _count include.
++   */
++  async countReferrals(customerId: string): Promise<number> {
++    return this.prisma.customer.count({
++      where: { referredById: customerId },
++    });
++  }
++
++  /**
++   * Read-only view of a customer's referral standing without full profile includes.
++   */
++  async getReferralStanding(customerId: string): Promise<{
++    referralCode: string | null;
++    referredById: string | null;
++    referralCount: number;
++    totalLoyaltyPoints: number;
++  }> {
++    const row = await this.prisma.customer.findUnique({
++      where: { id: customerId },
++      select: {
++        referralCode: true,
++        referredById: true,
++        totalLoyaltyPoints: true,
++        _count: { select: { referrals: true } },
++      },
++    });
++    if (!row) {
++      throw new NotFoundException('Customer not found');
++    }
++    return {
++      referralCode: row.referralCode,
++      referredById: row.referredById,
++      referralCount: row._count.referrals,
++      totalLoyaltyPoints: row.totalLoyaltyPoints ?? 0,
++    };
++  }
++}
+diff --git a/src/customers/referral.utils.ts b/src/customers/referral.utils.ts
+new file mode 100644
+index 0000000..3f4a335
+--- /dev/null
++++ b/src/customers/referral.utils.ts
+@@ -0,0 +1,214 @@
++import { ReferralError, ReferralErrorCode } from './referral.constants';
++
++/**
++ * Normalize a raw referral code from the request body.
++ * Trims leading/trailing whitespace; does not change case.
++ */
++export function normalizeReferralCode(
++  raw: string | undefined | null,
++): string {
++  if (typeof raw !== 'string') {
++    return '';
++  }
++  return raw.trim();
++}
++
++/**
++ * Decide whether a non-empty code is usable for redemption against `me`.
++ * Returns an error code when the attempt must be rejected before any DB write
++ * that awards points; returns null when the attempt may proceed to lookup.
++ */
++export function precheckRedemptionEligibility(args: {
++  code: string;
++  myReferralCode: string | null | undefined;
++  myReferredById: string | null | undefined;
++}): ReferralErrorCode | null {
++  const { code, myReferralCode, myReferredById } = args;
++  if (!code) {
++    return ReferralError.INVALID;
++  }
++  if (myReferredById) {
++    return ReferralError.NOT_ELIGIBLE;
++  }
++  if (myReferralCode && myReferralCode === code) {
++    return ReferralError.NOT_ELIGIBLE;
++  }
++  return null;
++}
++
++/**
++ * After the referrer row is loaded, confirm the caller is allowed to claim it.
++ */
++export function postcheckReferrer(args: {
++  referrerId: string | undefined | null;
++  callerId: string;
++}): ReferralErrorCode | null {
++  if (!args.referrerId) {
++    return ReferralError.NOT_FOUND;
++  }
++  if (args.referrerId === args.callerId) {
++    return ReferralError.NOT_ELIGIBLE;
++  }
++  return null;
++}
++
++/**
++ * Build the success payload returned to the client after a successful redeem.
++ */
++export function buildRedeemSuccess(
++  referredById: string,
++  pointsAwarded: number,
++): { referredById: string; pointsAwarded: number } {
++  return { referredById, pointsAwarded };
++}
++
++/**
++ * Shape used when enriching a customer profile for the authenticated me surface.
++ */
++export function attachReferralSummary<T extends Record<string, unknown>>(
++  customer: T,
++  referralCount: number,
++): T & { referralCount: number; totalLoyaltyPoints: number } {
++  const points =
++    typeof (customer as any).totalLoyaltyPoints === 'number'
++      ? (customer as any).totalLoyaltyPoints
++      : 0;
++  return {
++    ...customer,
++    referralCount,
++    totalLoyaltyPoints: points,
++  };
++}
++
++/**
++ * Guard helpers for unit tests and defensive coding — pure predicates.
++ */
++export function isBlankCode(code: string): boolean {
++  return code.length === 0;
++}
++
++export function isSelfReferral(
++  code: string,
++  myCode: string | null | undefined,
++): boolean {
++  return !!myCode && myCode === code;
++}
++
++export function alreadyReferred(
++  referredById: string | null | undefined,
++): boolean {
++  return !!referredById;
++}
++
++/**
++ * Sequence of checks used by the service layer. Extracted so tests can
++ * assert the same decision table the API relies on without spinning Nest.
++ */
++export function evaluateRedemptionAttempt(input: {
++  rawCode: string | undefined | null;
++  myReferralCode: string | null | undefined;
++  myReferredById: string | null | undefined;
++  referrerId: string | null | undefined;
++  callerId: string;
++}): { ok: true } | { ok: false; error: ReferralErrorCode } {
++  const code = normalizeReferralCode(input.rawCode);
++  const pre = precheckRedemptionEligibility({
++    code,
++    myReferralCode: input.myReferralCode,
++    myReferredById: input.myReferredById,
++  });
++  if (pre) {
++    return { ok: false, error: pre };
++  }
++  const post = postcheckReferrer({
++    referrerId: input.referrerId,
++    callerId: input.callerId,
++  });
++  if (post) {
++    return { ok: false, error: post };
++  }
++  return { ok: true };
++}
++
++/**
++ * Validate that a points award is the configured constant (defensive).
++ */
++export function assertAwardAmount(points: number, expected: number): void {
++  if (points !== expected) {
++    throw new Error(
++      `Unexpected referral award ${points}; expected ${expected}`,
++    );
++  }
++}
++
++/**
++ * Produce a stable snapshot of eligibility inputs for logging/audit.
++ * Does not include PII beyond ids and codes already known to the system.
++ */
++export function eligibilitySnapshot(input: {
++  callerId: string;
++  code: string;
++  myReferralCode: string | null | undefined;
++  myReferredById: string | null | undefined;
++  referrerId: string | null | undefined;
++}): Record<string, string | boolean | null> {
++  return {
++    callerId: input.callerId,
++    code: input.code,
++    myReferralCode: input.myReferralCode ?? null,
++    alreadyReferred: alreadyReferred(input.myReferredById),
++    isSelfCode: isSelfReferral(input.code, input.myReferralCode),
++    referrerId: input.referrerId ?? null,
++  };
++}
++
++/**
++ * Merge multiple referrer lookup strategies (exact code only today).
++ * Reserved for future case-insensitive or alias lookups without changing
++ * the redeem transaction.
++ */
++export function pickReferrerId(
++  candidates: Array<{ id: string } | null | undefined>,
++): string | null {
++  for (const c of candidates) {
++    if (c && c.id) {
++      return c.id;
++    }
++  }
++  return null;
++}
++
++/**
++ * Ensure the response body never leaks internal fields.
++ */
++export function sanitizeRedeemResponse(body: {
++  referredById: string;
++  pointsAwarded: number;
++  [key: string]: unknown;
++}): { referredById: string; pointsAwarded: number } {
++  return {
++    referredById: String(body.referredById),
++    pointsAwarded: Number(body.pointsAwarded),
++  };
++}
++
++/**
++ * Profile field defaults when the customer row is sparse.
++ */
++export function defaultProfileExtras(referralCount = 0, points = 0) {
++  return {
++    referralCount: Math.max(0, referralCount | 0),
++    totalLoyaltyPoints: typeof points === 'number' ? points : 0,
++  };
++}
++
++/**
++ * True when the HTTP client sent a body that is missing the code key entirely
++ * versus sending an explicit empty string (both map to invalid after normalize).
++ */
++export function missingCodeKey(body: unknown): boolean {
++  if (body == null || typeof body !== 'object') {
++    return true;
++  }
++  return !Object.prototype.hasOwnProperty.call(body, 'code');
++}
