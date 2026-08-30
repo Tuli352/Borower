@@ -1,9 +1,9 @@
 diff --git a/src/customers/customers.regression.spec.ts b/src/customers/customers.regression.spec.ts
 new file mode 100644
-index 0000000..a527a90
+index 0000000..263e927
 --- /dev/null
 +++ b/src/customers/customers.regression.spec.ts
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,388 @@
 +/**
 + * Regression coverage for existing CustomersService behaviour.
 + * These tests exercise APIs that already exist at the base commit and must
@@ -394,10 +394,10 @@ index 0000000..a527a90
 +});
 diff --git a/src/customers/referral.behavior.spec.ts b/src/customers/referral.behavior.spec.ts
 new file mode 100644
-index 0000000..c9f1a2b
+index 0000000..263e927
 --- /dev/null
 +++ b/src/customers/referral.behavior.spec.ts
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,294 @@
 +/**
 + * Behavioral tests for the referral redemption feature.
 + * Asserts only the public contract from instruction.md.
