@@ -1,15 +1,26 @@
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { ReferralService } from './referral.service';
 
 @Injectable()
 export class CustomersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private referralService: ReferralService,
+  ) {}
 
   findAll() {
     return this.prisma.customer.findMany({ orderBy: { createdAt: 'desc' } });
   }
 
-  async addSavedLocation(customerId: string, data: { name: string; address: string; latitude: number; longitude: number }) {
+  async addSavedLocation(
+    customerId: string,
+    data: { name: string; address: string; latitude: number; longitude: number },
+  ) {
     return this.prisma.savedLocation.create({
       data: {
         customerId,
@@ -36,13 +47,7 @@ export class CustomersService {
 
   async findOne(id: string) {
     try {
-      return await this.prisma.customer.findUnique({
-        where: { id },
-        include: {
-          orders: { orderBy: { createdAt: 'desc' } },
-          transactions: { orderBy: { createdAt: 'desc' } },
-        },
-      });
+      return await this.referralService.loadProfileWithReferralSummary(id);
     } catch (error: any) {
       throw new BadRequestException(`Database lookup failed: ${error.message}`);
     }
@@ -54,12 +59,13 @@ export class CustomersService {
 
   async create(data: any, accountId?: string) {
     const { referralCode: codeUsed, phone, email, ...rest } = data;
-    
-    // 1. Resolve or Create Account if not provided
+
     let effectiveAccountId = accountId;
     if (!effectiveAccountId) {
       if (!phone && !email) {
-        throw new Error('Either accountId, phone, or email must be provided to create a customer profile');
+        throw new Error(
+          'Either accountId, phone, or email must be provided to create a customer profile',
+        );
       }
 
       let account = await this.prisma.account.findFirst({
@@ -89,13 +95,13 @@ export class CustomersService {
       effectiveAccountId = account.id;
     }
 
-    // 2. Generate unique code for the new user
-    let newCode = this.generateReferralCode();
-    
-    // 3. Handle referrer if provided
+    const newCode = this.generateReferralCode();
+
     let referredById = null;
     if (codeUsed) {
-      const referrer = await this.prisma.customer.findUnique({ where: { referralCode: codeUsed } });
+      const referrer = await this.prisma.customer.findUnique({
+        where: { referralCode: codeUsed },
+      });
       if (referrer) {
         referredById = referrer.id;
       }
@@ -108,8 +114,8 @@ export class CustomersService {
         email,
         account: { connect: { id: effectiveAccountId } },
         referralCode: newCode,
-        referredBy: referredById ? { connect: { id: referredById } } : undefined
-      }
+        referredBy: referredById ? { connect: { id: referredById } } : undefined,
+      },
     });
   }
 
@@ -121,7 +127,9 @@ export class CustomersService {
       });
     } catch (error: any) {
       if (error.code === 'P2002') {
-        throw new BadRequestException('This email is already in use by another customer.');
+        throw new BadRequestException(
+          'This email is already in use by another customer.',
+        );
       }
       if (error.code === 'P2025') {
         throw new NotFoundException('Customer record not found.');
@@ -142,7 +150,6 @@ export class CustomersService {
   }
 
   async subscribeToPlus(id: string) {
-    // 1. Mark as plus member for 30 days
     const expiry = new Date();
     expiry.setDate(expiry.getDate() + 30);
 
@@ -150,26 +157,35 @@ export class CustomersService {
       where: { id: id },
       data: {
         isKogiPlus: true,
-        plusExpiry: expiry
-      }
+        plusExpiry: expiry,
+      },
     });
   }
 
   async getWallet(id: string) {
     const customer = await this.prisma.customer.findUnique({
       where: { id },
-      select: { walletBalance: true }
+      select: { walletBalance: true },
     });
     if (!customer) throw new NotFoundException('Customer not found');
     return customer;
   }
 
-  async getWalletTransactions(id: string, limit: number = 50, page: number = 1) {
+  async getWalletTransactions(
+    id: string,
+    limit: number = 50,
+    page: number = 1,
+  ) {
     return this.prisma.transaction.findMany({
       where: { customerId: id },
       orderBy: { createdAt: 'desc' },
       take: limit,
-      skip: (page - 1) * limit
+      skip: (page - 1) * limit,
     });
+  }
+
+  /** Public entry used by the controller for POST /customers/profile/referral */
+  redeemReferral(customerId: string, rawCode: string | undefined | null) {
+    return this.referralService.redeem(customerId, rawCode);
   }
 }
