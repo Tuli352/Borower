@@ -102,15 +102,44 @@ PY
 
 mkdir -p /logs/verifier
 
+# Anti-cheat: force a clean, isolated Jest run.
+# - Ignore any committed jest.config.* or package.json "jest" key that might
+#   install a custom reporter / testResultsProcessor that rewrites the JSON.
+# - Use only the built-in JSON reporter and a temporary minimal config.
+JEST_ISOLATED_CONFIG=$(mktemp /tmp/jest-isolated-XXXXXX.json)
+cat > "$JEST_ISOLATED_CONFIG" <<'EOF'
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "src",
+  "testRegex": ".*\\.spec\\.ts$",
+  "transform": { "^.+\\.(t|j)s$": "ts-jest" },
+  "testEnvironment": "node",
+  "reporters": ["default"],
+  "testResultsProcessor": null,
+  "globalSetup": null,
+  "globalTeardown": null,
+  "setupFiles": [],
+  "setupFilesAfterEnv": []
+}
+EOF
+
 # P2P: only customers.regression (green on base and with solution).
 # Do NOT run the stock Nest scaffold specs — several are already red on main
 # (Hello Kogi vs Hello World, missing DI mocks) and cannot be pass-to-pass.
-run_log npx jest --ci --testPathPatterns='customers\.regression\.spec' --json --outputFile=/logs/verifier/base.jest.json
+run_log npx jest --ci --config "$JEST_ISOLATED_CONFIG" \
+  --testPathPatterns='customers\.regression\.spec' \
+  --json --outputFile=/logs/verifier/base.jest.json \
+  --no-cache --forceExit
 jest_json_to_junit /logs/verifier/base.jest.json /logs/verifier/base.xml
 
-# F2P: referral utils + service specs (fail on base, pass with solution)
-run_log npx jest --ci --testPathPatterns='referral\.(utils|service)\.spec' --json --outputFile=/logs/verifier/new.jest.json
+# F2P: public-behavior referral suite (fail on base, pass with solution)
+run_log npx jest --ci --config "$JEST_ISOLATED_CONFIG" \
+  --testPathPatterns='referral\.behavior\.spec' \
+  --json --outputFile=/logs/verifier/new.jest.json \
+  --no-cache --forceExit
 jest_json_to_junit /logs/verifier/new.jest.json /logs/verifier/new.xml
+
+rm -f "$JEST_ISOLATED_CONFIG"
 
 set -e
 # >>> END RUN TESTS <<<
